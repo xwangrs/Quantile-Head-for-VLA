@@ -1,0 +1,321 @@
+# Quantile Head policy
+
+Quantile Head is the policy implementation for this paper. It extends the PI0.5 backbone from [OpenPI](https://github.com/Physical-Intelligence/openpi) with a marginal quantile action head and a trainable action-side soft prompt. Its registered policy type is `quantile_head`.
+
+The default model predicts ordered quantile knots for each action coordinate and horizon step, trained with the pinball loss. Evaluation can execute the median or sample quantile ranks shared across a chunk and correlated across replans. The learned distributions are marginal distributions; the temporal sampler supplies the dependence used at inference.
+
+The backbone is based on Physical Intelligence's PI0.5 model. Upstream model repositories such as `lerobot/pi05_base` keep their original names. Their published performance numbers do not describe the modified Quantile Head policy.
+
+## Installation Requirements
+
+1. Install LeRobot by following our [Installation Guide](./installation).
+2. Install the shared backbone dependencies by running:
+
+   ```bash
+   pip install -e ".[pi]"
+   ```
+
+## Usage
+
+Use the following policy type for training:
+
+```text
+policy.type=quantile_head
+```
+
+New checkpoints save `type="quantile_head"` and the current processor names. Resume and evaluation require this schema; old policy names and removed checkpoint fields are not migrated.
+
+## Training
+
+### Training Command Example
+
+Train Quantile Head from the base PI0.5 weights on your own dataset. This example freezes the VLM; see the [paper README](../../README.md#training) for the manuscript training budget and complete settings:
+
+```bash
+lerobot-train \
+    --dataset.repo_id=your_org/your_dataset \
+    --policy.type=quantile_head \
+    --output_dir=./outputs/quantile_head_training \
+    --job_name=quantile_head_training \
+    --policy.push_to_hub=false \
+    --policy.pretrained_path=lerobot/pi05_base \
+    --policy.compile_model=true \
+    --policy.gradient_checkpointing=true \
+    --wandb.enable=true \
+    --policy.dtype=bfloat16 \
+    --policy.freeze_vision_encoder=false \
+    --policy.train_expert_only=true \
+    --policy.action_generation_mode=regression \
+    --steps=3000 \
+    --policy.device=cuda \
+    --batch_size=32
+```
+
+### Key Training Parameters
+
+- **`--policy.compile_model=true`**: Enables model compilation for faster training
+- **`--policy.gradient_checkpointing=true`**: Reduces memory usage significantly during training
+- **`--policy.dtype=bfloat16`**: Use mixed precision training for efficiency
+- **`--batch_size=32`**: Batch size for training, adapt this based on your GPU memory
+- **`--policy.pretrained_path=lerobot/pi05_base`**: The base π₀.₅ model you want to finetune, options are:
+  - [lerobot/pi05_base](https://huggingface.co/lerobot/pi05_base)
+  - [lerobot/pi05_libero](https://huggingface.co/lerobot/pi05_libero) (specifically trained on the Libero dataset)
+
+### Training and Inference Parameters Explained
+
+| Parameter                                 | Default      | Description                                                                 |
+| ----------------------------------------- | ------------ | --------------------------------------------------------------------------- |
+| `freeze_vision_encoder`                   | `false`      | Do not freeze the vision encoder                                            |
+| `train_expert_only`                       | `false`      | Do not freeze the base VLM                                                  |
+| `soft_prompt_len`                         | `16`         | Number of action-suffix prompt tokens; `0` disables them                     |
+| `train_soft_prompt`                       | `true`       | Train the prompt parameter when `soft_prompt_len > 0`                       |
+| `soft_prompt_init_std`                    | `0.02`       | Normal initialization standard deviation for a new prompt                   |
+| `optimizer_soft_prompt_lr`                | `1e-4`       | Prompt learning rate; explicit `null` falls back to `optimizer_lr`          |
+| `optimizer_soft_prompt_weight_decay`      | `0.0`        | Weight decay for the prompt optimizer group                                 |
+| `action_generation_mode`                  | `regression` | Learn conditional marginal quantiles                                        |
+| `use_pure_regression_head`                | `false`      | Replace marginal quantiles with a direct point-action head                  |
+| `pure_regression_loss`                    | `l1`         | Point-head loss: absolute error (`l1`) or squared error (`l2`)               |
+| `marginal_quantile_num_knots`             | `21`         | Number of learned quantile knots; must be odd                               |
+| `marginal_quantile_min_level`             | `0.025`      | Probability level of the first learned knot                                 |
+| `marginal_quantile_initial_gap`           | `0.02`       | Initialization scale for adjacent quantile gaps                             |
+| `marginal_quantile_inference_mode`        | `median`     | Regression decoder: `median` or `temporal_sample`                           |
+| `marginal_quantile_sampling_temperature`  | `0.35`       | Spread of sampled quantile ranks; `0` selects the median                    |
+| `marginal_quantile_sampling_min_level`    | `0.1`        | Lowest rank used by `temporal_sample`                                       |
+| `marginal_quantile_sampling_max_level`    | `0.9`        | Highest rank used by `temporal_sample`                                      |
+| `marginal_quantile_sampling_ar_coefficient` | `0.9`      | Persistence of each rank between action-chunk replans                       |
+| `marginal_quantile_sampling_seed`         | `1000`       | Seed for the policy's dedicated inference generator                         |
+| `marginal_quantile_sampling_exclude_joints` | `["gripper"]` | Joint-name matches that always execute their median                      |
+
+**💡 Tip**: Keep `train_expert_only=false` (the default) to train the base PaliGemma VLM jointly with the action expert and action-side modules. Setting it to `true` freezes the base VLM.
+
+### Trainable action-suffix soft prompt
+
+QuantileHead configurations use 16 action-side prompt tokens by default; set `soft_prompt_len=0` to disable them. The image and language prefix stays unchanged. The action expert receives the suffix `[soft prompt][action tokens]`; the shared prompt is a parameter of shape `(soft_prompt_len, action_expert_width)`. With the default 1,024-dimensional action expert, 16 tokens add 16,384 parameters. The task text, tokenizer, and dataset format do not change.
+
+Prefix, prompt, and action tokens occupy separate attention blocks. The prompt attends to the prefix and its own block; action tokens attend to all three blocks. Prefix tokens cannot attend to the prompt or actions, and prompt tokens cannot attend to actions. Predictions use only the final `chunk_size` action tokens. This arrangement applies to quantile regression, pure regression, and flow matching during both training and inference.
+
+New training configurations already default to `soft_prompt_len=16`, `train_soft_prompt=true`, `soft_prompt_init_std=0.02`, `optimizer_soft_prompt_lr=1e-4`, and `optimizer_soft_prompt_weight_decay=0.0`; these five flags do not need to be repeated in the command. To freeze the base VLM while training the action expert and prompt, add:
+
+```bash
+--policy.train_expert_only=true \
+--policy.detach_action_from_vlm=false
+```
+
+The prompt has its own optimizer group with a default learning rate of `1e-4` and zero weight decay. Explicitly set `optimizer_soft_prompt_lr=null` to use the policy learning rate instead. The learning-rate schedule preserves the prompt group's ratio to the base learning rate. `train_soft_prompt=false` freezes the prompt while keeping its tokens active. With `train_expert_only=true`, the VLM is frozen and its prefix is detached; the action-side prompt still receives gradients. Explicit `detach_action_from_vlm=true` is also compatible with this prompt. Setting `train_expert_only=false` allows joint VLM training. Gradient checkpointing remains supported.
+
+Start a **new training run from a compatible base checkpoint**, with a new output directory, to add these prompt tokens. `lerobot-train` can initialize a completely absent prompt and quantile head during fresh training. In Python, use `QuantileHeadPolicy.from_pretrained(..., config=prompt_config, allow_missing_action_modules=True)` for that bootstrap; `allow_missing_soft_prompt=True` is also available when only the prompt is absent. These initialization permissions do not permit mismatched prompt shapes or partially missing modules. Normal saving includes `model.soft_prompt` and the prompt configuration. Explicit values saved in a checkpoint, including `soft_prompt_len=0`, remain in use when loading it unless explicitly overridden; changing defaults does not rewrite saved configurations. Resume and evaluation require the trained prompt with its saved shape; they must not silently replace missing weights with random initialization.
+
+PEFT with an active action-suffix prompt is explicitly unsupported: this standalone parameter has no implemented adapter save/load contract. Adding `soft_prompt` to `modules_to_save` does not enable it. Use standard policy checkpoints for prompt training; PEFT without a prompt remains supported with `soft_prompt_len=0`.
+
+### Optional pure regression baseline
+
+The default `use_pure_regression_head=false` preserves the existing quantile architecture, loss, and decoder. To train a **new point-regression baseline**, add these flags to the training command:
+
+```bash
+--policy.action_generation_mode=regression \
+--policy.use_pure_regression_head=true \
+--policy.pure_regression_loss=l1
+```
+
+Use a new output directory, for example `--output_dir=outputs/quantile_head_regression`. Keep the quantile experiment's dataset, action horizon, optimizer, training budget, normalization, freezing settings, and `soft_prompt_len`, including the prompt-specific optimizer settings. The switch does not enable or disable the soft prompt. The `QUANTILES` data normalization remains independent of the choice of prediction head.
+
+This head uses the same VLM, action expert, zero action query, zero time condition, and `action_out_proj` to predict one action vector per horizon step. It does **not** construct `quantile_delta_proj` or quantile levels. `l1` minimizes absolute error; `l2` minimizes squared error. Both losses exclude padded action dimensions, padded timesteps, and the coordinates selected by the existing training loss mask. Valid losses are averaged within each sample and then across the batch; an entirely padded sample contributes zero. `reduction="none"` retains per-sample losses for RA-BC. Training logs use `loss_pure_regression_l1` or `loss_pure_regression_l2` alongside `loss` and `loss_per_dim`.
+
+These are ordinary L1/L2 losses, without an extra factor of 0.5. Median-only pinball loss equals half the L1 loss, so report loss scaling when comparing supervision objectives. For an independent baseline, initialize both runs from the same original base checkpoint, rather than finetuning the already trained quantile checkpoint with L1. Keep any newly initialized shared weights aligned when testing exactly matched initialization: skipping construction of the quantile head changes random-number consumption, so the same seed alone does not guarantee identical new soft-prompt weights. Repeated training seeds help assess variation but do not establish identical initialization.
+
+The switch and loss are saved in `config.json`. Evaluation uses the saved switch and produces deterministic actions in one forward pass. Quantile sampling parameters have no effect in pure regression mode. For example, after training:
+
+```bash
+lerobot-eval \
+    --env.type=libero \
+    --env.task=libero_10 \
+    --eval.batch_size=1 \
+    --eval.n_episodes=50 \
+    --policy.path=outputs/quantile_head_regression/checkpoints/last/pretrained_model \
+    --policy.n_action_steps=10 \
+    --env.max_parallel_tasks=1 \
+    --output_dir=outputs/eval_quantile_head_regression
+```
+
+Keep the default `--quantile_head_quantile_decoder=policy` and unset `LEROBOT_QUANTILE_HEAD_VIZ_DIR` for this evaluation. Quantile decoder overrides and quantile-distribution visualization reject point heads. Use the evaluation command above for the pure regression baseline. `use_pure_regression_head=true` also rejects `action_generation_mode=flow_matching`.
+
+Checkpoint loading remains strict: a trained quantile checkpoint contains gap-head parameters and cannot be converted into an independently trained point-regression baseline by changing the evaluation switch. Pure checkpoints must contain their action projection and, when enabled, trained prompt weights. Starting fresh training from the original base checkpoint retains the existing prompt-initialization behavior.
+
+### Marginal action quantiles
+
+In regression mode with `use_pure_regression_head=false`, the default training objective is the marginal pinball loss. The default `median` inference mode is deterministic: every horizon and action dimension uses its learned median (the middle quantile knot). There is no Copula head or dependence loss.
+
+Use `--policy.marginal_quantile_variant` to select a training ablation, saved in the checkpoint configuration:
+
+| Value | Training behavior |
+| --- | --- |
+| `standard` | Default: all quantiles use average pinball loss and ordered gaps around the median. |
+| `median_only` | Keep the full head and initialization, but supervise only Q(0.5) with half the L1 loss, without division by the total number of quantiles. |
+| `stop_median_gradient` | Keep all quantile losses and ordered gaps, but detach the median only when constructing nonmedian quantiles. The gap branch still trains shared features. |
+| `independent` | Predict all nonmedian quantiles directly with separate output coordinates, without ordering or coupling them to the median. Initial quantile values match the standard head. |
+
+All three ablations require the regression quantile head. `median_only` and `independent` require median inference and reject distribution decoder overrides: their other quantiles are unsupervised or may cross. For comparisons, evaluate all variants with median inference. Independent checkpoints carry a persistent architecture tag so their output weights cannot silently load as ordered-gap weights, or vice versa. When a new independent head is initialized from a base checkpoint, its initial predictions are matched to the loaded action projection. The head construction consumes the same randomness as the standard quantile model, preserving shared initial weights for identical seeds and base checkpoints.
+
+The training metric `marginal_quantile_crossing_fraction` reports the fraction of adjacent quantile pairs that cross on nonpadded actions. `marginal_quantile_supervised_knots` is 1 for `median_only` and the configured knot count otherwise. Run each experiment from the same original base checkpoint with a separate output directory. See the [training variant guide](../../sh/train_quantile_variants.md) and its accompanying script for complete training and evaluation commands.
+
+For controlled randomness during evaluation, set `marginal_quantile_inference_mode=temporal_sample`. At replan index $k$, the policy samples one latent value per action dimension and updates it as
+
+$$
+z_{k,d} = \rho z_{k-1,d} + \sqrt{1-\rho^2}\,\epsilon_{k,d}, \qquad
+r_{k,d}=2\Phi(Tz_{k,d})-1, \qquad
+u_{k,d}=\begin{cases}
+0.5+r_{k,d}(0.5-u_{\min}), & r_{k,d}<0,\\
+0.5+r_{k,d}(u_{\max}-0.5), & r_{k,d}\geq0.
+\end{cases}
+$$
+
+It then executes $Q_{t,d}(u_{k,d})$ for every horizon $t$ in that predicted chunk. Sharing the rank across the chunk avoids frame-to-frame jitter, while the AR coefficient $\rho$ controls how quickly the rank changes between replans. The lower and upper bounds must bracket 0.5; the centered mapping makes temperature $T=0$ exactly median decoding even when the bounds are asymmetric. Dimensions whose names match `marginal_quantile_sampling_exclude_joints` are also fixed at rank 0.5; the default excludes the gripper.
+
+For example, enable the sampler for a LIBERO evaluation with:
+
+```bash
+lerobot-eval \
+    --env.type=libero \
+    --env.task=libero_10 \
+    --eval.batch_size=1 \
+    --eval.n_episodes=10 \
+    --policy.path=/path/to/pretrained_model \
+    --policy.n_action_steps=10 \
+    --policy.marginal_quantile_inference_mode=temporal_sample \
+    --policy.marginal_quantile_sampling_temperature=0.35 \
+    --policy.marginal_quantile_sampling_min_level=0.1 \
+    --policy.marginal_quantile_sampling_max_level=0.9 \
+    --policy.marginal_quantile_sampling_ar_coefficient=0.9 \
+    --policy.marginal_quantile_sampling_seed=1000 \
+    --policy.marginal_quantile_sampling_exclude_joints='["gripper"]' \
+    --env.max_parallel_tasks=1 \
+    --output_dir=./outputs/quantile_head_eval
+```
+
+This decoder adds deliberately structured test-time randomness to independently learned marginal quantiles; it is not a learned joint or temporal action distribution. Different action dimensions still receive independently sampled latent values. Use `median` for the deterministic baseline and compare both modes over enough episodes before drawing conclusions.
+
+There is no quantile-gap barrier or minimum-width constraint, so the learned quantiles may naturally collapse in deterministic regions. `marginal_quantile_initial_gap` sets the gap parameterization scale (and the gap produced by a zero-initialized raw head); it does not impose a lower bound.
+
+The evaluation visualization samples each learned marginal independently only to draw diagnostic histograms. Those histogram samples are not sent to the environment and do not advance the policy sampler's random generator or AR state. `median_actions_*` remains the saved deterministic reference, while the rollout follows the configured inference mode. The learned outer knots retain their configured quantile levels, and the diagnostic sampler linearly extrapolates the first and last segments to probability levels 0 and 1.
+
+When `LEROBOT_QUANTILE_HEAD_VIZ_DIR` is set, evaluation also aggregates the environment-scale actions actually sent to each task. Every task directory contains `executed_actions.npz`, `R_action.csv`, `R_action.png`, `R_delta.csv`, and `R_delta.png`. `R_delta` is the Pearson correlation matrix of `action[t] - action[t-1]`; differences are computed within each episode before they are combined, so episode boundaries and post-termination padding do not affect the result. A constant action dimension has undefined correlation and is shown as `N/A`. Evaluation suites such as `libero_10` produce one set of statistics per task rather than mixing all tasks into one matrix.
+
+### Evaluation-only decoder ablations
+
+`lerobot-eval` supports additional decoders for a trained QuantileHead regression checkpoint. Add one of these **top-level** flags to the evaluation command above (without the `policy.` prefix), keeping `--env.max_parallel_tasks=1`:
+
+| Flag | Decoding behavior |
+| --- | --- |
+| `--quantile_head_quantile_decoder=policy` | Default: use the policy's configured `median` or `temporal_sample` decoder. |
+| `--quantile_head_quantile_decoder=independent_rank` | E: draw an independent rank for each action dimension and each step within the predicted chunk, freshly at every replan. |
+| `--quantile_head_quantile_decoder=gaussian_temporal` | F/F0: Gaussian substitution with the existing chunk-shared rank sampler. |
+| `--quantile_head_quantile_decoder=quantile_expectation` | L: deterministic numerical expectation of the learned quantile function. |
+| `--quantile_head_quantile_decoder=fixed_width` | M: sample with previously calibrated action-dimension widths. |
+| `--quantile_head_quantile_decoder=calibrate_width` | Calibration pass that collects widths for M while executing median actions. |
+
+These overrides affect the actions executed by the environment. They require no retraining and do not change model weights, checkpoint configuration, or the number of model forward passes. Explicit E/F flags override `marginal_quantile_inference_mode`; temperature, rank bounds, excluded joints, and sampler seed still apply. E ignores the AR coefficient. For a controlled comparison, compare E against `temporal_sample` with AR coefficient `0` to isolate sharing within a chunk, then vary the AR coefficient separately. Use separate output directories and keep the checkpoint, chunk size, execution horizon, numerical precision, and environment seeds fixed across runs.
+
+F constructs its Gaussian in normalized action coordinates, before the usual action postprocessing:
+
+$$
+\mu_{t,d}=Q_{t,d}(0.5),\qquad
+\sigma_{t,d}=\frac{Q_{t,d}(0.9)-Q_{t,d}(0.1)}{2\Phi^{-1}(0.9)},\qquad
+a_{t,d}=\mu_{t,d}+\sigma_{t,d}\Phi^{-1}(u_{k,d}).
+$$
+
+The 0.1 and 0.9 anchors are interpolated from the learned quantile knots; the learned grid must cover both levels. This matches the predicted median and 10–90% interval **width**, not the true variance or both interval endpoints for an asymmetric distribution. The Gaussian is derived from the same quantile checkpoint, not independently trained. Compare F with the original `temporal_sample` decoder using the same temperature, bounds, AR coefficient, and seeds to test the contribution of the marginal distribution's shape. F calls the original AR sampler once per replan, including for zero-width predictions. Ranks are clipped only to float32 numerical interior bounds before the inverse normal CDF; zero-width coordinates remain at their median. Both E and F return the exact median without advancing the sampler when temperature is zero, and excluded joints always execute their median.
+
+For identical sampler-call and reset histories, F preserves the original AR latents, ranks, and random-generator states. Different episode lengths can change those histories, so identical seeds do not guarantee paired ranks across entire benchmark runs. F computes Gaussian fitting and inverse CDF operations in float32 (or preserves float64 fitting inputs), using the original decoder's rank quantization first.
+
+Nondefault runs save the decoder settings and Gaussian fitting formula, where applicable, under `quantile_head_quantile_ablation` in `eval_info.json`. Visualization files label the active `policy_decoder`, but their diagnostic histograms and quantile curves still show the **learned quantile marginals**, not the Gaussian substitute or the actual temporal rank process. Use the saved executed-action statistics to analyze rollout behavior.
+
+The repository's [evaluation runner](../../sh/eval_quantile_ablations.sh) runs A, B, and C by default. Pass an explicit trained checkpoint and a new output directory:
+
+```bash
+# Preview commands without evaluating or creating output directories.
+QUANTILE_DRY_RUN=1 bash sh/eval_quantile_ablations.sh \
+  /path/to/pretrained_model outputs/quantile_sampling_preview 10 0
+
+# Median, independent chunk ranks, and temporally correlated chunk ranks.
+bash sh/eval_quantile_ablations.sh \
+  /path/to/pretrained_model outputs/quantile_sampling 50 0 1 2
+
+# Compare gripper exclusion while saving executed-action diagnostics.
+QUANTILE_EVAL_VARIANTS="A B C C_all" QUANTILE_EVAL_VIZ=1 \
+  bash sh/eval_quantile_ablations.sh \
+  /path/to/pretrained_model outputs/quantile_gripper_check 50 0
+```
+
+| Variant | Change from the shared settings |
+| --- | --- |
+| A | Deterministic median. |
+| B / C / D | Chunk-shared ranks with AR coefficients 0 / 0.7 / 1. |
+| C_all | C with gripper sampling enabled. |
+| E | Independent ranks for each action coordinate and horizon step. |
+| F / F0 | Gaussian substitution with AR coefficients 0.7 / 0. |
+| G / H / I | B with rank bounds [0.2, 0.8] / [0.3, 0.7] / [0.4, 0.6]. |
+| J / K | B with sampling temperatures 0.15 / 1. |
+| L | Deterministic quantile expectation, using 128 nodes by default. |
+| M | B with fixed widths estimated in a separate calibration pass. |
+
+The shared settings are temperature 0.35, rank bounds [0.1, 0.9], gripper at its median, execution horizon 10, and environment seed 1000. The runner's C uses AR coefficient 0.7; the policy configuration default is 0.9. `QUANTILE_EVAL_VARIANTS` selects an ordered subset of the variants above. A and L run only for the first sampler seed because they are deterministic.
+
+See [D–M decoder comparisons](../../sh/eval_quantile_dm.md) for expectation and fixed-width settings, and [training variants](../../sh/train_quantile_variants.md) for the independently trained supervision ablations. Fixed-width calibration uses separate random initial states and is excluded from evaluation scores.
+
+Each evaluation saves `command.txt`, `eval.log`, and `eval_info.json` under `OUTPUT_ROOT/seed_SEED/VARIANT/`. `run_all.log` records progress, and `status.tsv` records exit codes. Existing run directories are rejected. A failed evaluation is recorded before the runner continues; the runner exits nonzero if any setting fails.
+
+Resolved sampler settings appear under `quantile_head_quantile_sampler` in `eval_info.json`, including the prompt length, prompt location, and sampled coordinates. On LIBERO's seven-dimensional action space, B/C exclude the final gripper coordinate, while C_all samples all seven. Nondefault decoders also save `quantile_head_quantile_ablation`. Read `overall.pc_success` for overall success and each task's `metrics.successes` for individual outcomes. Timing fields include simulation and video work, so they are not model-only inference latency.
+
+With LIBERO's fixed initial states, different sampler seeds measure sampling variation on the same initial-state sequence. Increasing episodes covers more entries until the initial-state table wraps.
+
+If your dataset is not converted with `quantiles`, you can convert it with the following command:
+
+```bash
+python src/lerobot/scripts/augment_dataset_quantile_stats.py \
+    --repo-id=your_dataset
+```
+
+Or train QuantileHead with this normalization mapping: `--policy.normalization_mapping='{"ACTION": "MEAN_STD", "STATE": "MEAN_STD", "VISUAL": "IDENTITY"}'`
+
+## Relative Actions
+
+By default, QuantileHead uses the dataset action representation without relative conversion. You can enable **relative actions** so the model predicts offsets relative to the current robot state. This can improve training stability for certain setups.
+
+To use relative actions, first recompute your dataset stats in relative space via the CLI:
+
+```bash
+lerobot-edit-dataset \
+    --repo_id your_dataset \
+    --operation.type recompute_stats \
+    --operation.relative_action true \
+    --operation.chunk_size 50 \
+    --operation.relative_exclude_joints "['gripper']" \
+    --push_to_hub true
+```
+
+Or equivalently in Python:
+
+```python
+from lerobot.datasets import LeRobotDataset, recompute_stats
+
+dataset = LeRobotDataset("your_dataset")
+recompute_stats(dataset, relative_action=True, chunk_size=50, relative_exclude_joints=["gripper"])
+dataset.push_to_hub()
+```
+
+The `chunk_size` should match your policy's `chunk_size` (default 50 for QuantileHead). `relative_exclude_joints` lists joint names that should remain in absolute space (e.g. gripper commands). Use `--push_to_hub true` to upload the updated stats to the Hub.
+
+Then train with relative actions enabled:
+
+```bash
+lerobot-train \
+    --dataset.repo_id=your_dataset \
+    --policy.type=quantile_head \
+    --policy.use_relative_actions=true \
+    --policy.relative_exclude_joints='["gripper"]' \
+    ...
+```
+
+## License
+
+This model follows the **Apache 2.0 License**, consistent with the original [OpenPI repository](https://github.com/Physical-Intelligence/openpi).
