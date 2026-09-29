@@ -1,327 +1,175 @@
-# Quantile Head for Vision-Language-Action
+# Quantile Head for Vision-Language-Action Models
 
-Research code for **Quantile Head for Vision-Language-Action**, built on the
-[LeRobot](https://github.com/huggingface/lerobot) implementation of the
-[OpenPI](https://github.com/Physical-Intelligence/openpi) π₀.₅ backbone.
-The policy in this repository is named **`quantile_head`**.
+**Xuan Wang · Yinan Wu · Haoran Duan · Jungong Han**<br>
+Department of Automation, Tsinghua University
 
-Quantile Head predicts an ordered set of marginal action quantiles in one forward
-pass. Training supervises the full set of quantiles; deployment can use their
-median directly or sample from the same learned quantile curves.
+[Method](#method) · [Results](#results) · [Getting started](#getting-started) · [Training and evaluation](docs/reproduction.md)
+
+Quantile Head predicts **ordered marginal action quantiles in one forward pass**.
+Joint quantile supervision trains a strong median policy, while the same head
+supports quantile sampling at inference without retraining. Built on the π₀.₅
+backbone, it combines a frozen vision-language model with learnable prompts and a
+trainable action expert.
 
 ## Method
 
-- **Frozen VLM, trainable action expert.** Images, instructions, and discretized
-  robot state form the observation prefix. Sixteen learnable tokens precede the
-  action tokens and provide observation-conditioned context to the action expert.
-- **Ordered marginal quantiles.** For each future step and action dimension, the
-  head predicts a median and separate positive gaps on either side. Cumulative
-  gaps give 21 noncrossing quantiles at levels `0.025, 0.0725, …, 0.975`.
-- **Masked pinball supervision.** All quantiles share the same coordinate-label
-  mask. Training randomly drops 10% of valid action-coordinate labels; padded
-  coordinates do not contribute to the loss.
-- **One-pass decoding.** The expert receives zero action queries and a zero time
-  condition. Median decoding is deterministic. Optional sampling interpolates the
-  marginal quantile curves and can correlate ranks between replanning steps.
+![Quantile Head architecture: a frozen VLM, learnable prompts, and an action expert predict ordered action quantiles trained with masked pinball loss.](docs/assets/quantile-head-architecture.png)
 
-The predictions describe **marginal** distributions per action coordinate; they
-are not a learned joint distribution over an entire action chunk.
+*Architecture from Figure 2 of the paper.*
 
-## Results reported in the manuscript
+- **Predict a median and positive gaps.** The head accumulates independently
+  learned left and right gaps around the median to produce 21 noncrossing
+  quantiles for each action coordinate.
+- **Train all quantiles together.** Masked pinball loss supervises the quantiles
+  with a shared coordinate mask, randomly withholding 10% of valid action labels.
+  Sixteen learnable prompt tokens adapt the frozen VLM features for control.
+- **Decode in one pass.** The default policy executes the median. Optional
+  sampling interpolates the predicted marginal quantiles and can correlate
+  quantile ranks across replanning steps.
 
-The following are manuscript results, averaged over three independent training
-seeds. They are not results produced by installing or testing this checkout.
+<details>
+<summary>Attention and loss masks (Figure 3)</summary>
 
-| Benchmark / setting | Success rate (%) |
-| --- | ---: |
-| LIBERO-Spatial | 99.0 |
-| LIBERO-Object | 100.0 |
-| LIBERO-Goal | 99.6 |
-| LIBERO-Long (`libero_10`) | 98.6 |
-| **LIBERO four-suite average** | **99.3** |
-| LIBERO-Plus, zero-shot transfer | 87.1 |
-| LIBERO-Plus, supervised fine-tuning | 89.1 |
-| LIBERO-Pro, zero-shot transfer | 60.2 |
-| Real robot, two-task average | 75.0 |
+![Block self-attention among VLM, prompt, and action tokens; coordinate-label masks shared across all predicted quantiles.](docs/assets/quantile-head-masks.png)
 
-These results use median decoding. The main LIBERO evaluation uses 1,000 episodes
-per task and trained model. LIBERO-Plus evaluates all 10,030 perturbed instances;
-LIBERO-Pro averages the object, position, semantic, and task perturbations.
-The real-robot tasks are apple placement and cuboid removal. Sampling studies use
-separate protocols and should not be substituted for the main benchmark results.
+Prompts attend to VLM and prompt features; action tokens attend to all three
+groups. During training, each example receives a newly sampled coordinate-label
+mask shared across all quantiles. The head models one marginal distribution per
+action coordinate; sampling specifies how ranks are coupled across coordinates
+and time.
 
-## Repository guide
+</details>
 
-| Path | Contents |
-| --- | --- |
-| [`src/lerobot/policies/quantile_head/`](src/lerobot/policies/quantile_head/) | Configuration, model, loss, prompts, sampling, and processors |
-| [`src/lerobot/scripts/lerobot_train.py`](src/lerobot/scripts/lerobot_train.py) | Single-GPU and distributed training |
-| [`src/lerobot/scripts/lerobot_eval.py`](src/lerobot/scripts/lerobot_eval.py) | Simulation evaluation and rollout outputs |
-| [`src/lerobot/scripts/quantile_head_eval_decoders.py`](src/lerobot/scripts/quantile_head_eval_decoders.py) | Evaluation-only decoding ablations |
-| [`sh/`](sh/README.md) | Training variants and sampling experiments |
-| [`tests/`](tests/) | Policy, checkpoint, processor, and evaluation tests |
-| [`docs/source/`](docs/source/) | Inherited LeRobot environment and hardware documentation |
+## Results
 
-The underlying package and commands retain the `lerobot` name. Other LeRobot
-policies and hardware utilities remain available in the source tree.
+The tables below compare Quantile Head with other methods on **LIBERO,
+LIBERO-Pro, LIBERO-Plus, and two real-robot tasks** (Tables 1–3 of the paper).
+Success rates are percentages (higher is better). Quantile Head uses
+**deterministic median decoding**. External baselines retain their original
+training and evaluation protocols.
 
-## Installation and required assets
+**Bold** and <ins>underlined</ins> values in Tables 1–2 mark the best and
+second-best results. Quantile Head benchmark rates average three training seeds.
+LIBERO uses 1,000 episodes per suite and trained model; LIBERO-Plus covers all
+10,030 benchmark instances per model; LIBERO-Pro uses 100 episodes per task and
+model.
 
-Use Python 3.12 or later. The LIBERO setup below requires Linux, a working CUDA
-PyTorch environment, and MuJoCo rendering dependencies. Install FFmpeg for video
-based datasets. From this repository's root, install the required extras with
-[`uv`](https://docs.astral.sh/uv/):
+### Table 1. LIBERO and LIBERO-Pro
+
+**(a) LIBERO**
+
+| Method | Spatial | Object | Goal | Long | Avg. |
+|---|---:|---:|---:|---:|---:|
+| Diffusion Policy<sup>a</sup> | 78.3 | 92.5 | 68.3 | 50.5 | 72.4 |
+| OpenVLA<sup>a</sup> | 84.7 | 88.4 | 79.2 | 53.7 | 76.5 |
+| π₀-FAST<sup>a</sup> | 96.4 | 96.8 | 88.6 | 60.2 | 85.5 |
+| π₀<sup>a</sup> | 96.8 | 98.8 | 95.8 | 85.2 | 94.2 |
+| OpenVLA-OFT | 97.6 | 98.4 | 97.9 | 94.5 | 97.1 |
+| π₀.₅ | 98.8 | 98.2 | 98.0 | 92.4 | 96.85 |
+| VLANeXt | <ins>99.0</ins> | 99.2 | 96.6 | 94.8 | 97.4 |
+| SimVLA | **99.6** | <ins>99.8</ins> | <ins>98.6</ins> | 96.4 | 98.6 |
+| WLA-0 | <ins>99.0</ins> | **100.0** | 97.8 | 97.6 | 98.6 |
+| InternVLA-A1.5 | 98.6 | <ins>99.8</ins> | <ins>98.6</ins> | <ins>98.4</ins> | <ins>98.9</ins> |
+| Quantile Head | <ins>99.0</ins> | **100.0** | **99.6** | **98.6** | **99.3** |
+
+Long denotes LIBERO-10. Avg. is the four-suite mean; source-reported precision is retained. <sup>a</sup>Results are from Kim et al., *Fine-tuning Vision-Language-Action Models: Optimizing Speed and Success* (OpenVLA-OFT), Table I. The OpenVLA-OFT row is also from that paper. The π₀.₅ reference is the official openpi 30k-step checkpoint reported in its LIBERO README. Other baselines follow their original papers.
+
+**(b) LIBERO-Pro**
+
+| Method | Object | Position | Semantic | Task | Avg. |
+|---|---:|---:|---:|---:|---:|
+| OpenVLA | <ins>93.0</ins> | 0.0 | 97.3 | 0.0 | 47.6 |
+| π₀ | 90.5 | 0.0 | 90.5 | 0.0 | 45.3 |
+| π₀.₅ | **96.0** | <ins>20.8</ins> | 95.8 | 0.8 | <ins>53.3</ins> |
+| MolmoAct | 76.0 | 1.5 | 85.8 | 1.5 | 41.2 |
+| X-VLA | 79.0 | 0.8 | 96.8 | 6.8 | 45.8 |
+| OpenVLA-OFT<sup>b</sup> | 27.6 | 5.8 | 59.0 | 0.6 | 23.3 |
+| X-VLA (CR eval.)<sup>b</sup> | 78.4 | 1.6 | 82.9 | 16.4 | 44.8 |
+| VLA-Adapter<sup>b</sup> | 73.8 | 0.0 | 90.8 | <ins>19.8</ins> | 46.1 |
+| SimVLA | 81.5 | 8.3 | **98.8** | 6.0 | 48.6 |
+| SUREFlow | 68.5 | 0.0 | 87.8 | 0.0 | 39.1 |
+| **Quantile Head** | 85.8 | **31.3** | <ins>97.8</ins> | **26.0** | **60.2** |
+
+Each perturbation category averages Spatial, Object, Goal, and Long; Avg. averages the four categories, excluding Original and Environment. Quantile Head uses its LIBERO-trained checkpoint without Pro fine-tuning. The first five baselines use the official LIBERO-Pro leaderboard. <sup>b</sup>Results are from Wu et al., *Continuous Reasoning for Vision-Language-Action*. SimVLA and SUREFlow use their original reports.
+
+### Table 2. LIBERO-Plus
+
+**(a) Zero-shot transfer** — LIBERO-trained policies without further training.
+
+| Method | Camera | Robot | Language | Light | Background | Noise | Layout | Total |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| OpenVLA<sup>a</sup> | 0.8 | 3.5 | 23.0 | 8.1 | 34.8 | 15.2 | 28.5 | 15.6 |
+| π₀-FAST<sup>a</sup> | 65.1 | 21.6 | 61.0 | 73.2 | 73.2 | 74.4 | 68.8 | 61.6 |
+| π₀<sup>a</sup> | 13.8 | 6.0 | 58.8 | 85.0 | 81.4 | 79.0 | 68.9 | 53.6 |
+| OpenVLA-OFT<sup>a</sup> | 56.4 | 31.9 | 79.5 | 88.7 | 93.3 | 75.8 | 74.2 | 69.6 |
+| π₀.₅<sup>b</sup> | 75.8 | 79.4 | 83.3 | 95.5 | <ins>95.0</ins> | 89.6 | 87.0 | <ins>85.7</ins> |
+| VLANeXt | <ins>90.4</ins> | 65.7 | 81.8 | 95.9 | 82.5 | 94.1 | 80.8 | 83.9 |
+| GAM | 83.1 | 70.0 | <ins>84.8</ins> | **97.2** | 94.3 | <ins>95.3</ins> | 79.1 | 85.5 |
+| GE-Act 2.0 | **94.1** | 50.7 | 81.4 | 94.0 | 60.5 | **95.5** | 83.1 | 80.4 |
+| ACoT-VLA<sup>b</sup> | 68.9 | <ins>80.3</ins> | 84.1 | 95.6 | 93.1 | 81.5 | **88.3** | 83.6 |
+| Quantile Head | 71.6 | **80.7** | **87.6** | <ins>96.1</ins> | **97.2** | 94.8 | <ins>87.8</ins> | **87.1** |
+
+**(b) Supervised fine-tuning** — uses LIBERO-Plus training data.
+
+| Method | Camera | Robot | Language | Light | Background | Noise | Layout | Total |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| π₀<sup>b</sup> | 79.6 | 21.1 | 72.5 | 84.7 | 86.2 | 68.3 | 69.4 | 67.4 |
+| π₀.₅<sup>b</sup> | 70.3 | 41.7 | 81.1 | <ins>97.3</ins> | 94.6 | 71.8 | <ins>84.9</ins> | 75.7 |
+| OpenVLA-OFT+ | <ins>92.8</ins> | 30.3 | <ins>85.8</ins> | 94.9 | 93.9 | 89.3 | 77.6 | 79.6 |
+| MemoryVLA<sup>d</sup> | 91.4 | 48.6 | 79.4 | 95.2 | 95.3 | 94.0 | 75.7 | 81.9 |
+| MemoryVLA++ | **96.8** | 49.7 | 71.0 | 96.6 | <ins>97.0</ins> | **96.0** | 78.6 | 82.7 |
+| ACoT-VLA<sup>b</sup> | 91.2 | <ins>62.5</ins> | 80.3 | 95.1 | 91.5 | 88.3 | <ins>84.9</ins> | <ins>84.1</ins> |
+| Quantile Head (SFT) | 88.6 | **77.0** | **86.2** | **97.4** | **97.3** | <ins>94.1</ins> | **87.3** | **89.1** |
+
+Source superscripts are local to Table 2: <sup>a</sup>Fei et al., *LIBERO-Plus*; <sup>b</sup>Zhong et al., *ACoT-VLA*; <sup>d</sup>Shi et al., *MemoryVLA++*. Unmarked baselines use their original papers. The π₀ and π₀.₅ SFT results from ACoT-VLA freeze the LLM backbone. Baseline totals follow each source's aggregation. Quantile Head pools all 10,030 benchmark instances for Total and reports the mean over three training seeds; Total is instance-weighted, not an unweighted mean of categories or suites.
+
+### Table 3. Real-robot evaluation
+
+| Real-robot task | π₀.₅ | Quantile Head | Gain (percentage points) |
+|---|---:|---:|---:|
+| Place apple on yellow plate | 31 | 52 | +21 |
+| Remove cuboid from blue plate | 86 | 98 | +12 |
+| Average | 58.5 | 75.0 | +16.5 |
+
+The π₀.₅ baseline is fully fine-tuned. Both methods use the same demonstration data, optimization settings, and evaluation conditions.
+
+## Getting started
+
+The implementation uses the policy name **`quantile_head`** within LeRobot.
+For LIBERO experiments, use Python 3.12+, Linux, a CUDA-enabled PyTorch
+environment, FFmpeg, and MuJoCo rendering dependencies.
 
 ```bash
+git clone https://github.com/xwangrs/Quantile-Head-for-VLA.git
+cd Quantile-Head-for-VLA
 uv sync --extra training --extra evaluation --extra pi --extra libero
 export MUJOCO_GL=egl
 ```
 
-The policy dependency extra is still named **`pi`**, as defined in
-[`pyproject.toml`](pyproject.toml). There is no `quantile_head` package extra.
-For a compatible headless GPU server, `egl` selects the MuJoCo rendering backend.
-See [`docker/Dockerfile.benchmark.libero`](docker/Dockerfile.benchmark.libero)
-for the repository's Linux benchmark environment.
+Prepare a LeRobot-format dataset and compatible π₀.₅ initialization weights for
+training, or a trained Quantile Head checkpoint for evaluation. Model weights,
+datasets, and benchmark assets are obtained separately.
 
-Prepare these assets separately:
+The [training and evaluation guide](docs/reproduction.md) provides the complete
+commands, dataset requirements, paper evaluation protocols, sampling options,
+and checkpoint format. The policy dependency extra is named `pi`.
 
-1. A LeRobot-format training dataset, including its videos, metadata, task text,
-   and normalization statistics. Supply its actual repository ID and local root.
-2. A compatible π₀.₅ base weight directory for initialization, or a trained
-   `quantile_head` checkpoint for evaluation. A LeRobot pretrained directory uses
-   `model.safetensors`; evaluation also needs its saved config and processors.
-3. The tokenizer used by the processors: `google/paligemma-3b-pt-224`. It must be
-   accessible through Hugging Face or already available in the local cache.
-4. LIBERO task definitions, assets, and initial states for simulation evaluation.
+## Code structure
 
-Datasets, benchmark assets, and model weights are not bundled in this source
-checkout. This README does not provide a public Quantile Head checkpoint or paper
-URL. Offline runs require all model, tokenizer, dataset, and environment assets to
-be cached beforehand.
-
-State and action `QUANTILES` normalization requires `q01` and `q99` statistics.
-This data normalization is separate from the quantile-regression objective. If an
-older dataset lacks these statistics, the following utility updates its metadata:
-
-```bash
-uv run python -m lerobot.scripts.augment_dataset_quantile_stats \
-  --repo-id=your_dataset_id \
-  --root=/path/to/lerobot_dataset
-```
-
-## Training
-
-The manuscript freezes the VLM and trains the action expert, 16 prompt tokens, and
-quantile head. It uses AdamW, a global batch size of 128 on two GPUs, and one epoch
-on each training dataset. The prompt learning rate is `1e-4` with zero weight
-decay; other trainable parameters use `2.5e-5` and weight decay `0.01`. Warmup lasts
-200 steps for LIBERO and 666 for LIBERO-Plus, followed by cosine decay.
-
-The training CLI uses a **step budget**, not an epoch argument. For the unfiltered,
-non-streaming dataset below, compute one epoch from `total_frames` and the global
-batch size. The final distributed batch may repeat examples to fill the batch.
-If you select episodes or change the sampler, recalculate the budget from the
-number of selected samples.
-
-```bash
-export QH_DATASET_ID=libero
-export QH_DATASET_ROOT=/path/to/lerobot_libero
-export QH_BASE_WEIGHTS=/path/to/pi05_base
-export QH_TRAIN_SEED=1000
-export QH_OUTPUT_DIR=outputs/quantile_head_libero_seed1000
-
-QH_TRAIN_STEPS=$(uv run python -c \
-  'import json, math, sys; print(math.ceil(json.load(open(sys.argv[1]))["total_frames"] / 128))' \
-  "$QH_DATASET_ROOT/meta/info.json")
-
-CUDA_VISIBLE_DEVICES=0,1 uv run accelerate launch \
-  --multi_gpu --num_processes=2 -m lerobot.scripts.lerobot_train \
-  --dataset.repo_id="$QH_DATASET_ID" \
-  --dataset.root="$QH_DATASET_ROOT" \
-  --dataset.video_backend=pyav \
-  --policy.type=quantile_head \
-  --policy.pretrained_path="$QH_BASE_WEIGHTS" \
-  --policy.push_to_hub=false \
-  --policy.action_generation_mode=regression \
-  --policy.use_pure_regression_head=false \
-  --policy.marginal_quantile_variant=standard \
-  --policy.marginal_quantile_num_knots=21 \
-  --policy.marginal_quantile_min_level=0.025 \
-  --policy.marginal_quantile_initial_gap=0.02 \
-  --policy.action_loss_mask_ratio=0.1 \
-  --policy.soft_prompt_len=16 \
-  --policy.train_soft_prompt=true \
-  --policy.train_expert_only=true \
-  --policy.detach_action_from_vlm=false \
-  --policy.normalization_mapping='{"ACTION":"QUANTILES","STATE":"QUANTILES","VISUAL":"IDENTITY"}' \
-  --policy.chunk_size=50 \
-  --policy.n_action_steps=10 \
-  --policy.marginal_quantile_inference_mode=median \
-  --policy.optimizer_lr=2.5e-5 \
-  --policy.optimizer_weight_decay=0.01 \
-  --policy.optimizer_soft_prompt_lr=1e-4 \
-  --policy.optimizer_soft_prompt_weight_decay=0.0 \
-  --policy.scheduler_warmup_steps=200 \
-  --policy.scheduler_decay_steps="$QH_TRAIN_STEPS" \
-  --policy.scheduler_decay_lr=2.5e-6 \
-  --policy.gradient_checkpointing=true \
-  --policy.compile_model=false \
-  --policy.device=cuda \
-  --batch_size=64 \
-  --steps="$QH_TRAIN_STEPS" \
-  --seed="$QH_TRAIN_SEED" \
-  --resume=false \
-  --wandb.enable=false \
-  --job_name=quantile_head_libero \
-  --output_dir="$QH_OUTPUT_DIR"
-```
-
-Replace all asset paths and the dataset ID before running. `batch_size=64` is per
-GPU, giving a global batch size of 128. The command leaves precision at the
-implementation default (`float32`); `--policy.dtype=bfloat16` is supported on
-compatible hardware. Record precision and runtime choices with each experiment.
-Use a fresh output directory for each independent training seed.
-
-For LIBERO-Plus training, use its dataset, recompute the one-epoch step budget, and
-set `--policy.scheduler_warmup_steps=666`. The manuscript initializes the LIBERO
-and LIBERO-Plus models from the same base checkpoint. The scripts in `sh/` retain
-experiment-specific defaults such as 6,000 steps and local cluster paths; those
-values do not automatically implement the manuscript's one-epoch budget.
-
-The last saved policy is written under
-`OUTPUT_DIR/checkpoints/last/pretrained_model`. Keep the complete checkpoint
-folder, including processor configurations and statistics.
-
-## LIBERO evaluation
-
-Set `QH_CHECKPOINT` to a trained `quantile_head` pretrained-model directory. This
-small run checks the four standard suites with 10 episodes per task:
-
-```bash
-export QH_CHECKPOINT=/path/to/quantile_head/checkpoints/last/pretrained_model
-export MUJOCO_GL=egl
-
-uv run lerobot-eval \
-  --policy.path="$QH_CHECKPOINT" \
-  --policy.device=cuda \
-  --policy.n_action_steps=10 \
-  --policy.marginal_quantile_inference_mode=median \
-  --env.type=libero \
-  --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
-  --env.init_states=true \
-  --env.max_parallel_tasks=1 \
-  --eval.batch_size=1 \
-  --eval.n_episodes=10 \
-  --seed=1000 \
-  --output_dir=outputs/eval/quantile_head_median
-```
-
-For the main manuscript protocol, set `--eval.n_episodes=1000` and evaluate each
-of the three independently trained checkpoints. Average task success rates within
-each suite, then average the four suite rates, and finally average corresponding
-rates across the three trained models. Changing only a sampler seed does not
-create an independent training replicate. Evaluation writes `eval_info.json` and
-rollout outputs under the chosen output directory.
-
-The controller executes 10 actions before replanning; `chunk_size=50` is the
-prediction horizon. Dataset features, action representation, camera names, and
-normalization must agree with the checkpoint and environment. The inherited
-[LIBERO documentation](docs/source/libero.mdx) describes the environment; its
-upstream model scores and example episode counts are not the Quantile Head paper
-protocol.
-
-LIBERO-Plus needs its separate fork and assets; see the
-[environment guide](docs/source/libero_plus.mdx) and
-[Docker setup](docker/Dockerfile.benchmark.libero_plus). A default LIBERO-Plus run
-is not sufficient to reproduce all 10,030 paper instances. LIBERO-Pro likewise
-requires its benchmark installation and perturbation protocol; the standard
-LIBERO command above does not reproduce either robustness result.
-
-## Inference and ablations
-
-`marginal_quantile_inference_mode=median` uses the central prediction. To sample
-from a trained ordered head, replace that flag in the evaluation command with:
-
-```bash
---policy.marginal_quantile_inference_mode=temporal_sample \
---policy.marginal_quantile_sampling_temperature=0.35 \
---policy.marginal_quantile_sampling_min_level=0.4 \
---policy.marginal_quantile_sampling_max_level=0.6 \
---policy.marginal_quantile_sampling_ar_coefficient=0.7 \
---policy.marginal_quantile_sampling_seed=0 \
---policy.marginal_quantile_sampling_exclude_joints='["gripper"]'
-```
-
-Each motion dimension receives its own quantile rank, shared across the predicted
-chunk. The AR coefficient controls correlation between replanning steps: `0`
-resamples ranks independently, while `1` holds each rank for the episode. The
-example explicitly sets a narrow rank window and keeps the gripper at its median.
-The class defaults are `[0.1, 0.9]`, temperature `0.35`, AR coefficient `0.9`, and
-sampler seed `1000`; they are not a universal paper sampling configuration.
-
-| Parameter | Supported values / purpose |
+| Path | Purpose |
 | --- | --- |
-| `marginal_quantile_variant` | `standard`, `median_only`, `stop_median_gradient`, `independent` |
-| `use_pure_regression_head` / `pure_regression_loss` | Point-regression baselines with `l1` or `l2` loss |
-| `action_generation_mode` | `regression` or the retained `flow_matching` baseline |
-| `marginal_quantile_inference_mode` | `median` or `temporal_sample` |
-| `marginal_quantile_sampling_*` | Temperature, rank window, AR coefficient, seed, and excluded joints |
-| `action_loss_mask_ratio` | Fraction of valid coordinate labels dropped during training |
-| `soft_prompt_len` / `train_expert_only` | Prompt length and whether to freeze the VLM |
+| [`src/lerobot/policies/quantile_head/`](src/lerobot/policies/quantile_head/) | Model, ordered quantiles, masked loss, prompts, sampling, and processors |
+| [`src/lerobot/scripts/lerobot_train.py`](src/lerobot/scripts/lerobot_train.py) | Single-GPU and distributed training |
+| [`src/lerobot/scripts/lerobot_eval.py`](src/lerobot/scripts/lerobot_eval.py) | Simulation evaluation and rollout outputs |
+| [`src/lerobot/scripts/quantile_head_eval_decoders.py`](src/lerobot/scripts/quantile_head_eval_decoders.py) | Evaluation-only decoding ablations |
+| [`sh/`](sh/README.md) | Training variants and sampling experiments |
+| [`docs/reproduction.md`](docs/reproduction.md) | Installation, training, evaluation, and checkpoint instructions |
 
-`median_only` and `independent` support median inference only. A head variant is a
-training/architecture choice and must not be changed merely to evaluate a saved
-checkpoint. The current implementation does not expose every manuscript ablation
-as a configuration option; for example, there is no symmetric-gap variant.
+## Acknowledgments and license
 
-Additional evaluation-only decoders are selected with the **top-level** option
-`--quantile_head_quantile_decoder`: `policy`, `independent_rank`,
-`gaussian_temporal`, `quantile_expectation`, `fixed_width`, and `calibrate_width`.
-The Gaussian and fixed-width decoders reuse predictions from the quantile model;
-they are not independently trained models. Fixed-width decoding requires a
-separate calibration file. See [`sh/eval_quantile_dm.md`](sh/eval_quantile_dm.md)
-for controls, calibration, outputs, and dry runs.
-
-The [training-variant guide](sh/train_quantile_variants.md) documents the ablation
-launcher. Both training and evaluation scripts support command previews:
-
-```bash
-QUANTILE_TRAIN_DRY_RUN=1 bash sh/train_quantile_variants.sh median_only
-QUANTILE_DRY_RUN=1 bash sh/eval_quantile_dm.sh \
-  "$QH_CHECKPOINT" outputs/quantile_dm_preview 50 0
-```
-
-## Policy name and checkpoint format
-
-Use `--policy.type=quantile_head` for new training runs and the new Python imports:
-
-```python
-from lerobot.policies.quantile_head.configuration_quantile_head import QuantileHeadConfig
-from lerobot.policies.quantile_head.modeling_quantile_head import QuantileHeadPolicy
-```
-
-This is a breaking rename of the modified policy previously stored under `pi05`.
-Old `pi05` policy types, Python import paths, processor names, and legacy
-compatibility-only configuration fields are not supported. Use checkpoints saved
-with the current `quantile_head` config and processors for evaluation. Initializing
-new training from compatible π₀.₅ backbone weights is a separate supported use
-case; it does not make old experiment checkpoints interchangeable with this format.
-
-Update evaluation flags from `pi05_quantile_*` to `quantile_head_quantile_*` and
-visualization environment variables from `LEROBOT_PI05_VIZ_*` to
-`LEROBOT_QUANTILE_HEAD_VIZ_*`. The current configuration in
-[`configuration_quantile_head.py`](src/lerobot/policies/quantile_head/configuration_quantile_head.py)
-is the source of truth for supported fields and validation.
-
-## Attribution and license
-
-This repository extends [Hugging Face LeRobot](https://github.com/huggingface/lerobot)
-and its port of [Physical Intelligence OpenPI](https://github.com/Physical-Intelligence/openpi).
-The π₀.₅ backbone is described in
-[π₀.₅: a Vision-Language-Action Model with Open-World Generalization](https://arxiv.org/abs/2504.16054).
-Please credit these upstream projects and the relevant benchmark and dataset
-creators when using this code.
-
-The code retains the upstream [Apache License 2.0](LICENSE) and source-file
-copyright notices. Model weights, datasets, and benchmark assets are distributed
-separately under their respective terms.
+This repository builds on [Hugging Face LeRobot](https://github.com/huggingface/lerobot)
+and its implementation of [Physical Intelligence OpenPI](https://github.com/Physical-Intelligence/openpi).
+We thank these projects and the LIBERO, LIBERO-Plus, and LIBERO-Pro benchmark
+authors. The code retains the upstream [Apache License 2.0](LICENSE) and source
+copyright notices. Weights, datasets, and benchmark assets retain their respective
+licenses.
