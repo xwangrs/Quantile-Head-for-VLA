@@ -3,7 +3,7 @@
 **Xuan Wang · Yinan Wu · Haoran Duan · Jungong Han**<br>
 Department of Automation, Tsinghua University
 
-[Method](#method) · [Results](#results) · [Getting started](#getting-started) · [Training and evaluation](docs/reproduction.md)
+[arXiv:2609.34061](https://arxiv.org/abs/2609.34061) · [Method](#method) · [Results](#results) · [Installation](#installation) · [Training](#training) · [Evaluation](#evaluation)
 
 Quantile Head predicts **ordered marginal action quantiles in one forward pass**.
 Joint quantile supervision trains a strong median policy, while the same head
@@ -133,37 +133,242 @@ Source superscripts are local to Table 2: <sup>a</sup>Fei et al., *LIBERO-Plus*;
 
 The π₀.₅ baseline is fully fine-tuned. Both methods use the same demonstration data, optimization settings, and evaluation conditions.
 
-## Getting started
+## Installation
 
-The implementation uses the policy name **`quantile_head`** within LeRobot.
-For LIBERO experiments, use Python 3.12+, Linux, a CUDA-enabled PyTorch
-environment, FFmpeg, and MuJoCo rendering dependencies.
+Set up the environment by following the **[official LeRobot installation guide](https://huggingface.co/docs/lerobot/installation)**,
+including Python, PyTorch/CUDA, and video dependencies. At the source-install
+step, install this repository in the activated environment:
 
 ```bash
 git clone https://github.com/xwangrs/Quantile-Head-for-VLA.git
 cd Quantile-Head-for-VLA
-uv sync --extra training --extra evaluation --extra pi --extra libero
-export MUJOCO_GL=egl
+pip install -e ".[training,evaluation,pi,libero]"
 ```
 
-Prepare a LeRobot-format dataset and compatible π₀.₅ initialization weights for
-training, or a trained Quantile Head checkpoint for evaluation. Model weights,
-datasets, and benchmark assets are obtained separately.
+For simulation assets and benchmark dependencies, follow the official
+[LIBERO](https://huggingface.co/docs/lerobot/libero),
+[LIBERO-Pro](https://github.com/Zxy-MLlab/LIBERO-PRO), and
+[LIBERO-Plus](https://huggingface.co/docs/lerobot/libero_plus) instructions.
+The benchmarks share the Python package name `libero`; use a separate environment
+for each benchmark and install its matching package and assets. In the Pro and
+Plus environments, replace `hf-libero` with the corresponding fork and add that
+fork's repository root to `PYTHONPATH` as described in its installation guide.
+Set `LIBERO_CONFIG_PATH` to a separate directory containing that benchmark's
+`config.yaml`, with the correct `assets`, `bddl_files`, `init_states`, and
+`datasets` paths.
 
-The [training and evaluation guide](docs/reproduction.md) provides the complete
-commands, dataset requirements, paper evaluation protocols, sampling options,
-and checkpoint format. The policy dependency extra is named `pi`.
+## Training
 
-## Code structure
+Both runs start from the same compatible π₀.₅ base weights and train for one epoch
+with a global batch size of 128 (64 per GPU on two GPUs). The VLM is frozen;
+the action expert, quantile head, and 16 prompt tokens are trained. Replace the
+dataset IDs and local paths below with your prepared LeRobot-format assets.
+Each dataset must contain `meta/info.json`, its videos, and `q01`/`q99` state and
+action statistics.
 
-| Path | Purpose |
-| --- | --- |
-| [`src/lerobot/policies/quantile_head/`](src/lerobot/policies/quantile_head/) | Model, ordered quantiles, masked loss, prompts, sampling, and processors |
-| [`src/lerobot/scripts/lerobot_train.py`](src/lerobot/scripts/lerobot_train.py) | Single-GPU and distributed training |
-| [`src/lerobot/scripts/lerobot_eval.py`](src/lerobot/scripts/lerobot_eval.py) | Simulation evaluation and rollout outputs |
-| [`src/lerobot/scripts/quantile_head_eval_decoders.py`](src/lerobot/scripts/quantile_head_eval_decoders.py) | Evaluation-only decoding ablations |
-| [`sh/`](sh/README.md) | Training variants and sampling experiments |
-| [`docs/reproduction.md`](docs/reproduction.md) | Installation, training, evaluation, and checkpoint instructions |
+Run either block from the repository root in the activated LeRobot environment.
+Use the same base-weight directory for both runs.
+
+### LIBERO training
+
+Use 200 warmup steps.
+
+```bash
+export QH_BASE_WEIGHTS=/path/to/pi05_base
+export QH_TRAIN_SEED=1000
+export QH_LIBERO_DATASET_ID=your_namespace/libero
+export QH_LIBERO_DATASET_ROOT=/path/to/lerobot_libero
+QH_LIBERO_STEPS=$(python -c \
+  'import json, math, sys; print(math.ceil(json.load(open(sys.argv[1]))["total_frames"] / 128))' \
+  "$QH_LIBERO_DATASET_ROOT/meta/info.json")
+
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
+  --multi_gpu --num_processes=2 --mixed_precision=no \
+  -m lerobot.scripts.lerobot_train \
+  --policy.type=quantile_head \
+  --policy.pretrained_path="$QH_BASE_WEIGHTS" \
+  --policy.push_to_hub=false \
+  --policy.train_expert_only=true \
+  --policy.gradient_checkpointing=true \
+  --policy.n_action_steps=10 \
+  --policy.device=cuda \
+  --dataset.video_backend=pyav \
+  --batch_size=64 \
+  --wandb.enable=false \
+  --dataset.repo_id="$QH_LIBERO_DATASET_ID" \
+  --dataset.root="$QH_LIBERO_DATASET_ROOT" \
+  --policy.scheduler_warmup_steps=200 \
+  --policy.scheduler_decay_steps="$QH_LIBERO_STEPS" \
+  --steps="$QH_LIBERO_STEPS" \
+  --seed="$QH_TRAIN_SEED" \
+  --job_name=quantile_head_libero \
+  --output_dir="outputs/quantile_head_libero_seed${QH_TRAIN_SEED}"
+```
+
+### LIBERO-Plus training
+
+Use 666 warmup steps.
+
+```bash
+export QH_BASE_WEIGHTS=/path/to/pi05_base
+export QH_TRAIN_SEED=1000
+export QH_PLUS_DATASET_ID=your_namespace/libero_plus
+export QH_PLUS_DATASET_ROOT=/path/to/lerobot_libero_plus
+QH_PLUS_STEPS=$(python -c \
+  'import json, math, sys; print(math.ceil(json.load(open(sys.argv[1]))["total_frames"] / 128))' \
+  "$QH_PLUS_DATASET_ROOT/meta/info.json")
+
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
+  --multi_gpu --num_processes=2 --mixed_precision=no \
+  -m lerobot.scripts.lerobot_train \
+  --policy.type=quantile_head \
+  --policy.pretrained_path="$QH_BASE_WEIGHTS" \
+  --policy.push_to_hub=false \
+  --policy.train_expert_only=true \
+  --policy.gradient_checkpointing=true \
+  --policy.n_action_steps=10 \
+  --policy.device=cuda \
+  --dataset.video_backend=pyav \
+  --batch_size=64 \
+  --wandb.enable=false \
+  --dataset.repo_id="$QH_PLUS_DATASET_ID" \
+  --dataset.root="$QH_PLUS_DATASET_ROOT" \
+  --policy.scheduler_warmup_steps=666 \
+  --policy.scheduler_decay_steps="$QH_PLUS_STEPS" \
+  --steps="$QH_PLUS_STEPS" \
+  --seed="$QH_TRAIN_SEED" \
+  --job_name=quantile_head_libero_plus \
+  --output_dir="outputs/quantile_head_libero_plus_seed${QH_TRAIN_SEED}"
+```
+
+The current `quantile_head` defaults provide the standard ordered 21-quantile
+head, 16 trainable prompts, 10% label masking, median decoding, a 50-action
+prediction horizon, and `QUANTILES` state/action normalization. They also provide
+the paper's AdamW settings: learning rate `2.5e-5` and weight decay `0.01` for
+ordinary trainable parameters, and `1e-4` with zero weight decay for prompts.
+The commands use the default `float32` policy and explicitly disable launcher
+mixed precision.
+
+The epoch budget assumes the complete, non-streaming dataset; the last distributed
+batch can repeat samples to fill the batch. If you filter episodes or change the
+sampler, recompute the budget for the selected samples. Set a new training seed
+and use a fresh output directory for each independent replicate. The last saved
+model is under `OUTPUT_DIR/checkpoints/last/pretrained_model`.
+
+For complete asset and checkpoint requirements, see the
+[training and evaluation guide](docs/reproduction.md).
+
+## Evaluation
+
+Run each block in the corresponding benchmark environment prepared above. Use a
+saved `quantile_head` checkpoint, including its config, processors, and statistics.
+All three evaluations use median decoding and execute ten actions before replanning.
+
+### LIBERO evaluation
+
+Evaluate all four suites with 100 episodes per task (1,000 per suite):
+
+```bash
+QH_CHECKPOINT=outputs/quantile_head_libero_seed1000/checkpoints/last/pretrained_model
+
+MUJOCO_GL=egl lerobot-eval \
+  --policy.path="$QH_CHECKPOINT" \
+  --policy.device=cuda \
+  --policy.n_action_steps=10 \
+  --policy.marginal_quantile_inference_mode=median \
+  --env.type=libero \
+  --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
+  --env.init_states=true \
+  --env.max_parallel_tasks=1 \
+  --eval.batch_size=1 \
+  --eval.n_episodes=100 \
+  --seed=1000 \
+  --output_dir=outputs/eval/libero_seed1000
+```
+
+### LIBERO-Pro evaluation
+
+With the official LIBERO-Pro fork and its BDDL/init-state files installed, use
+`--env.type=libero` and the perturbation suite names below. The suffixes `object`,
+`swap`, `lan`, and `task` select object, position, semantic, and task perturbations.
+The loop sets each base suite's episode limit explicitly.
+
+```bash
+QH_CHECKPOINT=outputs/quantile_head_libero_seed1000/checkpoints/last/pretrained_model
+QH_EVAL_OUTPUT=outputs/eval/libero_pro_seed1000
+
+(
+  set -e
+  for qh_spec in libero_spatial:280 libero_object:280 libero_goal:300 libero_10:800; do
+    qh_suite=${qh_spec%:*}
+    qh_max_steps=${qh_spec#*:}
+    MUJOCO_GL=egl lerobot-eval \
+      --policy.path="$QH_CHECKPOINT" \
+      --policy.device=cuda \
+      --policy.n_action_steps=10 \
+      --policy.marginal_quantile_inference_mode=median \
+      --env.type=libero \
+      --env.task="${qh_suite}_object,${qh_suite}_swap,${qh_suite}_lan,${qh_suite}_task" \
+      --env.task_ids='[0,1,2,3,4,5,6,7,8,9]' \
+      --env.episode_length="$qh_max_steps" \
+      --env.init_states=true \
+      --env.max_parallel_tasks=1 \
+      --eval.batch_size=1 \
+      --eval.n_episodes=100 \
+      --seed=1000 \
+      --output_dir="$QH_EVAL_OUTPUT/$qh_suite"
+  done
+)
+```
+
+This covers the four perturbation categories in Table 1(b), with 100 episodes per
+task. Average the four base-suite rates within each category, then average the
+four category rates.
+
+### LIBERO-Plus evaluation
+
+With the official LIBERO-Plus fork and assets installed, evaluate every registered
+instance once. The four suites contain 2,402, 2,518, 2,591, and 2,519 instances,
+respectively, for 10,030 in total. LIBERO-Plus Long uses a 520-step episode limit.
+
+```bash
+# Use the LIBERO-trained checkpoint for zero-shot evaluation.
+QH_CHECKPOINT=outputs/quantile_head_libero_seed1000/checkpoints/last/pretrained_model
+QH_EVAL_OUTPUT=outputs/eval/libero_plus_zero_shot_seed1000
+
+(
+  set -e
+  for qh_spec in libero_spatial:280 libero_object:280 libero_goal:300 libero_10:520; do
+    qh_suite=${qh_spec%:*}
+    qh_max_steps=${qh_spec#*:}
+    MUJOCO_GL=egl lerobot-eval \
+      --policy.path="$QH_CHECKPOINT" \
+      --policy.device=cuda \
+      --policy.n_action_steps=10 \
+      --policy.marginal_quantile_inference_mode=median \
+      --env.type=libero_plus \
+      --env.task="$qh_suite" \
+      --env.episode_length="$qh_max_steps" \
+      --env.init_states=true \
+      --env.max_parallel_tasks=1 \
+      --eval.batch_size=1 \
+      --eval.n_episodes=1 \
+      --seed=1000 \
+      --output_dir="$QH_EVAL_OUTPUT/$qh_suite"
+  done
+)
+```
+
+For supervised fine-tuning evaluation, set `QH_CHECKPOINT` to
+`outputs/quantile_head_libero_plus_seed1000/checkpoints/last/pretrained_model`
+and use a separate output directory such as `outputs/eval/libero_plus_sft_seed1000`.
+Compute Total by pooling successful episodes across all 10,030 instances. The
+evaluator saves per-instance results in `eval_info.json`; the seven perturbation
+category totals require grouping these results by the benchmark's categories.
+
+The paper's benchmark results average three independently trained checkpoints.
+Repeat the evaluations for each checkpoint with a separate output directory, then
+average their corresponding success rates.
 
 ## Acknowledgments and license
 

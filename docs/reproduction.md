@@ -7,21 +7,9 @@ training, simulation evaluation, and the supported inference configurations.
 
 ## Installation and required assets
 
-Use Python 3.12 or later. The LIBERO setup below requires Linux, a working CUDA
-PyTorch environment, and MuJoCo rendering dependencies. Install FFmpeg for video
-based datasets. From this repository's root, install the required extras with
-[`uv`](https://docs.astral.sh/uv/):
-
-```bash
-uv sync --extra training --extra evaluation --extra pi --extra libero
-export MUJOCO_GL=egl
-```
-
-The policy dependency extra is still named **`pi`**, as defined in
-[`pyproject.toml`](../pyproject.toml). There is no `quantile_head` package extra.
-For a compatible headless GPU server, `egl` selects the MuJoCo rendering backend.
-See [`docker/Dockerfile.benchmark.libero`](../docker/Dockerfile.benchmark.libero)
-for the repository's Linux benchmark environment.
+Follow the [official LeRobot installation guide](https://huggingface.co/docs/lerobot/installation)
+and the [repository installation instructions](../README.md#installation).
+Run the commands below in the activated environment with this repository installed.
 
 Prepare these assets separately:
 
@@ -43,7 +31,7 @@ This data normalization is separate from the quantile-regression objective. If a
 older dataset lacks these statistics, the following utility updates its metadata:
 
 ```bash
-uv run python -m lerobot.scripts.augment_dataset_quantile_stats \
+python -m lerobot.scripts.augment_dataset_quantile_stats \
   --repo-id=your_dataset_id \
   --root=/path/to/lerobot_dataset
 ```
@@ -69,12 +57,12 @@ export QH_BASE_WEIGHTS=/path/to/pi05_base
 export QH_TRAIN_SEED=1000
 export QH_OUTPUT_DIR=outputs/quantile_head_libero_seed1000
 
-QH_TRAIN_STEPS=$(uv run python -c \
+QH_TRAIN_STEPS=$(python -c \
   'import json, math, sys; print(math.ceil(json.load(open(sys.argv[1]))["total_frames"] / 128))' \
   "$QH_DATASET_ROOT/meta/info.json")
 
-CUDA_VISIBLE_DEVICES=0,1 uv run accelerate launch \
-  --multi_gpu --num_processes=2 -m lerobot.scripts.lerobot_train \
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
+  --multi_gpu --num_processes=2 --mixed_precision=no -m lerobot.scripts.lerobot_train \
   --dataset.repo_id="$QH_DATASET_ID" \
   --dataset.root="$QH_DATASET_ROOT" \
   --dataset.video_backend=pyav \
@@ -140,7 +128,7 @@ small run checks the four standard suites with 10 episodes per task:
 export QH_CHECKPOINT=/path/to/quantile_head/checkpoints/last/pretrained_model
 export MUJOCO_GL=egl
 
-uv run lerobot-eval \
+lerobot-eval \
   --policy.path="$QH_CHECKPOINT" \
   --policy.device=cuda \
   --policy.n_action_steps=10 \
@@ -175,8 +163,9 @@ LIBERO-Plus needs its separate fork and assets; see the
 [environment guide](../docs/source/libero_plus.mdx) and
 [Docker setup](../docker/Dockerfile.benchmark.libero_plus). A default LIBERO-Plus run
 is not sufficient to reproduce all 10,030 paper instances. LIBERO-Pro likewise
-requires its benchmark installation and perturbation protocol; the standard
-LIBERO command above does not reproduce either robustness result.
+requires its benchmark installation and perturbation protocol. Use the
+[three benchmark commands](../README.md#evaluation) for the complete suite selections
+and episode limits.
 
 ## Inference and ablations
 
@@ -220,17 +209,10 @@ Additional evaluation-only decoders are selected with the **top-level** option
 `gaussian_temporal`, `quantile_expectation`, `fixed_width`, and `calibrate_width`.
 The Gaussian and fixed-width decoders reuse predictions from the quantile model;
 they are not independently trained models. Fixed-width decoding requires a
-separate calibration file. See [`sh/eval_quantile_dm.md`](../sh/eval_quantile_dm.md)
-for controls, calibration, outputs, and dry runs.
+separate calibration file. The [policy guide](source/quantile_head.mdx) documents
+the decoder options. Use the direct [benchmark evaluation commands](../README.md#evaluation)
+for the paper's default median policy.
 
-The [training-variant guide](../sh/train_quantile_variants.md) documents the ablation
-launcher. Both training and evaluation scripts support command previews:
-
-```bash
-QUANTILE_TRAIN_DRY_RUN=1 bash sh/train_quantile_variants.sh median_only
-QUANTILE_DRY_RUN=1 bash sh/eval_quantile_dm.sh \
-  "$QH_CHECKPOINT" outputs/quantile_dm_preview 50 0
-```
 
 ## Policy name and checkpoint format
 

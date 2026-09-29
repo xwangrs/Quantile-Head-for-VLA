@@ -156,7 +156,7 @@ Use `--policy.marginal_quantile_variant` to select a training ablation, saved in
 
 All three ablations require the regression quantile head. `median_only` and `independent` require median inference and reject distribution decoder overrides: their other quantiles are unsupervised or may cross. For comparisons, evaluate all variants with median inference. Independent checkpoints carry a persistent architecture tag so their output weights cannot silently load as ordered-gap weights, or vice versa. When a new independent head is initialized from a base checkpoint, its initial predictions are matched to the loaded action projection. The head construction consumes the same randomness as the standard quantile model, preserving shared initial weights for identical seeds and base checkpoints.
 
-The training metric `marginal_quantile_crossing_fraction` reports the fraction of adjacent quantile pairs that cross on nonpadded actions. `marginal_quantile_supervised_knots` is 1 for `median_only` and the configured knot count otherwise. Run each experiment from the same original base checkpoint with a separate output directory. See the [training variant guide](../../sh/train_quantile_variants.md) and its accompanying script for complete training and evaluation commands.
+The training metric `marginal_quantile_crossing_fraction` reports the fraction of adjacent quantile pairs that cross on nonpadded actions. `marginal_quantile_supervised_knots` is 1 for `median_only` and the configured knot count otherwise. Run each experiment from the same original base checkpoint with a separate output directory. See the [training variant guide](../../sh/train_quantile_variants.md) and its accompanying script for training commands, and the [README evaluation section](../../README.md#evaluation) for direct `lerobot-eval` commands.
 
 For controlled randomness during evaluation, set `marginal_quantile_inference_mode=temporal_sample`. At replan index $k$, the policy samples one latent value per action dimension and updates it as
 
@@ -207,15 +207,15 @@ When `LEROBOT_QUANTILE_HEAD_VIZ_DIR` is set, evaluation also aggregates the envi
 | Flag | Decoding behavior |
 | --- | --- |
 | `--quantile_head_quantile_decoder=policy` | Default: use the policy's configured `median` or `temporal_sample` decoder. |
-| `--quantile_head_quantile_decoder=independent_rank` | E: draw an independent rank for each action dimension and each step within the predicted chunk, freshly at every replan. |
-| `--quantile_head_quantile_decoder=gaussian_temporal` | F/F0: Gaussian substitution with the existing chunk-shared rank sampler. |
-| `--quantile_head_quantile_decoder=quantile_expectation` | L: deterministic numerical expectation of the learned quantile function. |
-| `--quantile_head_quantile_decoder=fixed_width` | M: sample with previously calibrated action-dimension widths. |
-| `--quantile_head_quantile_decoder=calibrate_width` | Calibration pass that collects widths for M while executing median actions. |
+| `--quantile_head_quantile_decoder=independent_rank` | Draw an independent rank for each action dimension and each step within the predicted chunk, freshly at every replan. |
+| `--quantile_head_quantile_decoder=gaussian_temporal` | Gaussian substitution with the existing chunk-shared rank sampler. |
+| `--quantile_head_quantile_decoder=quantile_expectation` | Deterministic numerical expectation of the learned quantile function. |
+| `--quantile_head_quantile_decoder=fixed_width` | Sample with previously calibrated action-dimension widths. |
+| `--quantile_head_quantile_decoder=calibrate_width` | Calibration pass that collects widths for `fixed_width` while executing median actions. |
 
-These overrides affect the actions executed by the environment. They require no retraining and do not change model weights, checkpoint configuration, or the number of model forward passes. Explicit E/F flags override `marginal_quantile_inference_mode`; temperature, rank bounds, excluded joints, and sampler seed still apply. E ignores the AR coefficient. For a controlled comparison, compare E against `temporal_sample` with AR coefficient `0` to isolate sharing within a chunk, then vary the AR coefficient separately. Use separate output directories and keep the checkpoint, chunk size, execution horizon, numerical precision, and environment seeds fixed across runs.
+These overrides affect the actions executed by the environment. They require no retraining and do not change model weights, checkpoint configuration, or the number of model forward passes. Explicit `independent_rank` and `gaussian_temporal` flags override `marginal_quantile_inference_mode`; temperature, rank bounds, excluded joints, and sampler seed still apply. `independent_rank` ignores the AR coefficient. For a controlled comparison, compare it against `temporal_sample` with AR coefficient `0` to isolate sharing within a chunk, then vary the AR coefficient separately. Use separate output directories and keep the checkpoint, chunk size, execution horizon, numerical precision, and environment seeds fixed across runs.
 
-F constructs its Gaussian in normalized action coordinates, before the usual action postprocessing:
+`gaussian_temporal` constructs its Gaussian in normalized action coordinates, before the usual action postprocessing:
 
 $$
 \mu_{t,d}=Q_{t,d}(0.5),\qquad
@@ -223,48 +223,15 @@ $$
 a_{t,d}=\mu_{t,d}+\sigma_{t,d}\Phi^{-1}(u_{k,d}).
 $$
 
-The 0.1 and 0.9 anchors are interpolated from the learned quantile knots; the learned grid must cover both levels. This matches the predicted median and 10–90% interval **width**, not the true variance or both interval endpoints for an asymmetric distribution. The Gaussian is derived from the same quantile checkpoint, not independently trained. Compare F with the original `temporal_sample` decoder using the same temperature, bounds, AR coefficient, and seeds to test the contribution of the marginal distribution's shape. F calls the original AR sampler once per replan, including for zero-width predictions. Ranks are clipped only to float32 numerical interior bounds before the inverse normal CDF; zero-width coordinates remain at their median. Both E and F return the exact median without advancing the sampler when temperature is zero, and excluded joints always execute their median.
+The 0.1 and 0.9 anchors are interpolated from the learned quantile knots; the learned grid must cover both levels. This matches the predicted median and 10–90% interval **width**, not the true variance or both interval endpoints for an asymmetric distribution. The Gaussian is derived from the same quantile checkpoint, not independently trained. Compare `gaussian_temporal` with the original `temporal_sample` decoder using the same temperature, bounds, AR coefficient, and seeds to test the contribution of the marginal distribution's shape. It calls the original AR sampler once per replan, including for zero-width predictions. Ranks are clipped only to float32 numerical interior bounds before the inverse normal CDF; zero-width coordinates remain at their median. Both `independent_rank` and `gaussian_temporal` return the exact median without advancing the sampler when temperature is zero, and excluded joints always execute their median.
 
-For identical sampler-call and reset histories, F preserves the original AR latents, ranks, and random-generator states. Different episode lengths can change those histories, so identical seeds do not guarantee paired ranks across entire benchmark runs. F computes Gaussian fitting and inverse CDF operations in float32 (or preserves float64 fitting inputs), using the original decoder's rank quantization first.
+For identical sampler-call and reset histories, `gaussian_temporal` preserves the original AR latents, ranks, and random-generator states. Different episode lengths can change those histories, so identical seeds do not guarantee paired ranks across entire benchmark runs. It computes Gaussian fitting and inverse CDF operations in float32 (or preserves float64 fitting inputs), using the original decoder's rank quantization first.
 
 Nondefault runs save the decoder settings and Gaussian fitting formula, where applicable, under `quantile_head_quantile_ablation` in `eval_info.json`. Visualization files label the active `policy_decoder`, but their diagnostic histograms and quantile curves still show the **learned quantile marginals**, not the Gaussian substitute or the actual temporal rank process. Use the saved executed-action statistics to analyze rollout behavior.
 
-The repository's [evaluation runner](../../sh/eval_quantile_ablations.sh) runs A, B, and C by default. Pass an explicit trained checkpoint and a new output directory:
+Run `lerobot-eval` directly with an explicit trained checkpoint and a separate output directory for each setting; see the [README evaluation section](../../README.md#evaluation). The [training variant guide](../../sh/train_quantile_variants.md) covers independently trained supervision ablations. Fixed-width decoding requires a separate calibration file; calibration episodes must be excluded from evaluation scores.
 
-```bash
-# Preview commands without evaluating or creating output directories.
-QUANTILE_DRY_RUN=1 bash sh/eval_quantile_ablations.sh \
-  /path/to/pretrained_model outputs/quantile_sampling_preview 10 0
-
-# Median, independent chunk ranks, and temporally correlated chunk ranks.
-bash sh/eval_quantile_ablations.sh \
-  /path/to/pretrained_model outputs/quantile_sampling 50 0 1 2
-
-# Compare gripper exclusion while saving executed-action diagnostics.
-QUANTILE_EVAL_VARIANTS="A B C C_all" QUANTILE_EVAL_VIZ=1 \
-  bash sh/eval_quantile_ablations.sh \
-  /path/to/pretrained_model outputs/quantile_gripper_check 50 0
-```
-
-| Variant | Change from the shared settings |
-| --- | --- |
-| A | Deterministic median. |
-| B / C / D | Chunk-shared ranks with AR coefficients 0 / 0.7 / 1. |
-| C_all | C with gripper sampling enabled. |
-| E | Independent ranks for each action coordinate and horizon step. |
-| F / F0 | Gaussian substitution with AR coefficients 0.7 / 0. |
-| G / H / I | B with rank bounds [0.2, 0.8] / [0.3, 0.7] / [0.4, 0.6]. |
-| J / K | B with sampling temperatures 0.15 / 1. |
-| L | Deterministic quantile expectation, using 128 nodes by default. |
-| M | B with fixed widths estimated in a separate calibration pass. |
-
-The shared settings are temperature 0.35, rank bounds [0.1, 0.9], gripper at its median, execution horizon 10, and environment seed 1000. The runner's C uses AR coefficient 0.7; the policy configuration default is 0.9. `QUANTILE_EVAL_VARIANTS` selects an ordered subset of the variants above. A and L run only for the first sampler seed because they are deterministic.
-
-See [D–M decoder comparisons](../../sh/eval_quantile_dm.md) for expectation and fixed-width settings, and [training variants](../../sh/train_quantile_variants.md) for the independently trained supervision ablations. Fixed-width calibration uses separate random initial states and is excluded from evaluation scores.
-
-Each evaluation saves `command.txt`, `eval.log`, and `eval_info.json` under `OUTPUT_ROOT/seed_SEED/VARIANT/`. `run_all.log` records progress, and `status.tsv` records exit codes. Existing run directories are rejected. A failed evaluation is recorded before the runner continues; the runner exits nonzero if any setting fails.
-
-Resolved sampler settings appear under `quantile_head_quantile_sampler` in `eval_info.json`, including the prompt length, prompt location, and sampled coordinates. On LIBERO's seven-dimensional action space, B/C exclude the final gripper coordinate, while C_all samples all seven. Nondefault decoders also save `quantile_head_quantile_ablation`. Read `overall.pc_success` for overall success and each task's `metrics.successes` for individual outcomes. Timing fields include simulation and video work, so they are not model-only inference latency.
+Resolved sampler settings appear under `quantile_head_quantile_sampler` in `eval_info.json`, including the prompt length, prompt location, and sampled coordinates. On LIBERO's seven-dimensional action space, `marginal_quantile_sampling_exclude_joints='["gripper"]'` keeps the final gripper coordinate at its median; an empty list enables sampling for all seven coordinates. Nondefault decoders also save `quantile_head_quantile_ablation`. Read `overall.pc_success` for overall success and each task's `metrics.successes` for individual outcomes. Timing fields include simulation and video work, so they are not model-only inference latency.
 
 With LIBERO's fixed initial states, different sampler seeds measure sampling variation on the same initial-state sequence. Increasing episodes covers more entries until the initial-state table wraps.
 
